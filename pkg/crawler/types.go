@@ -20,6 +20,7 @@ type Index struct {
 	ArtifactID  string
 	Versions    []Version
 	ArchiveType types.ArchiveType
+	SyftPurl 	string
 }
 type Version struct {
 	Version string

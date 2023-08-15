@@ -10,10 +10,14 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 
+	"github.com/anchore/syft/syft/source"
+	"github.com/anchore/syft/syft"
+	"github.com/anchore/syft/syft/pkg/cataloger"
 	"github.com/PuerkitoBio/goquery"
 	"github.com/hashicorp/go-retryablehttp"
 	"golang.org/x/sync/semaphore"
@@ -24,6 +28,7 @@ const mavenRepoURL = "https://repo.maven.apache.org/maven2/"
 
 type Crawler struct {
 	dir  string
+	jarDir string
 	http *retryablehttp.Client
 
 	rootUrl string
@@ -51,8 +56,8 @@ func NewCrawler(opt Option) Crawler {
 
 	return Crawler{
 		dir:  indexDir,
+		jarDir: filepath.Join(opt.CacheDir, "jars"),
 		http: client,
-
 		rootUrl: opt.RootUrl,
 		urlCh:   make(chan string, opt.Limit*10),
 		limit:   semaphore.NewWeighted(opt.Limit),
@@ -193,10 +198,31 @@ func (c *Crawler) crawlSHA1(baseURL string, meta *Metadata) error {
 		Versions:    versions,
 		ArchiveType: types.JarType,
 	}
-	fileName := fmt.Sprintf("%s.json", index.ArtifactID)
-	filePath := filepath.Join(c.dir, index.GroupID, fileName)
-	if err := fileutil.WriteJSON(filePath, index); err != nil {
-		return xerrors.Errorf("json write error: %w", err)
+
+	keep := false
+
+	for _, version := range meta.Versioning.Versions {
+		jarFileName := fmt.Sprintf("/%s-%s.jar", meta.ArtifactID, version)
+		url := baseURL + version + jarFileName
+		isCorrect, syftPurl, err := c.correctIdFromJar(url, jarFileName, index.GroupID, index.ArtifactID)
+
+		if err != nil {
+			fmt.Println(err)
+		}
+			
+		if !isCorrect {
+			keep = true
+			index.SyftPurl = syftPurl
+			break
+		}
+	}
+	
+	if keep {
+		fileName := fmt.Sprintf("%s.json", index.ArtifactID)
+		filePath := filepath.Join(c.dir, index.GroupID, fileName)
+		if err := fileutil.WriteJSON(filePath, index); err != nil {
+			return xerrors.Errorf("json write error: %w", err)
+		}
 	}
 	return nil
 }
@@ -261,4 +287,66 @@ func (c *Crawler) fetchSHA1(url string) ([]byte, error) {
 		return nil, xerrors.Errorf("failed to decode sha1 %s: %w", url, err)
 	}
 	return sha1b, nil
+}
+
+func (c *Crawler) correctIdFromJar(url string, jarName string, groupId string, artifactId string) (bool, string, error) {
+	//fmt.Print(jarName)
+	filePath := filepath.Join(c.jarDir, groupId, jarName)
+	if err := os.MkdirAll(filepath.Dir(filePath), os.ModePerm); err != nil {
+		return false, "", xerrors.Errorf("unable to create a directory: %w", err)
+	}
+
+    f, err := os.Create(filePath)
+	if err != nil {
+		return false, "", xerrors.Errorf("unable to open %s: %w", filePath, err)
+	}
+	defer f.Close()
+	defer os.Remove(filePath)
+
+	resp, err := c.http.Get(url)
+	// some projects don't have xxx.jar and xxx.jar.sha1 files
+	if resp.StatusCode == http.StatusNotFound {
+		return false, "", nil // TODO add special error for this
+	}
+	if err != nil {
+		return false, "", xerrors.Errorf("can't get jar from %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+
+	// Writer the body to file
+	_, err = io.Copy(f, resp.Body)
+	if err != nil  {
+	  	return false, "", err
+	}
+
+	detection, err := source.Detect(filePath, source.DefaultDetectConfig())
+	if err != nil {
+        return false, "", fmt.Errorf("package cataloger: %w", err)
+    }
+
+	src, err := detection.NewSource(source.DefaultDetectionSourceConfig())
+	if err != nil {
+        return false, "", fmt.Errorf("package cataloger: %w", err)
+    }
+
+	catalog, _, _, err := syft.CatalogPackages(src, cataloger.DefaultConfig())
+    if err != nil {
+        return false, "", fmt.Errorf("package cataloger: %w", err)
+    }
+
+	if catalog != nil {
+		packages := catalog.PackagesByName(artifactId)
+		if len(packages) > 0 {
+			p := packages[0]
+
+			if strings.HasPrefix(p.PURL, fmt.Sprintf("pkg:maven/%s/%s", groupId, artifactId)) {
+				return true, p.PURL, nil
+			}
+
+			fmt.Printf("%s:%s syft purl: %s\n", groupId, artifactId, p.PURL)
+			return false, p.PURL, nil
+		}
+	}
+
+	return false, "", nil
 }
