@@ -1,5 +1,6 @@
 LDFLAGS=-ldflags "-s -w"
 GO_SRCS := $(shell find . -name *.go)
+CACHE_DIR := 
 
 .PHONY: test
 test:
@@ -13,16 +14,16 @@ trivy-java-db: $(GO_SRCS)
 
 .PHONY: db-crawl
 db-crawl: trivy-java-db
-	./trivy-java-db --cache-dir ./cache-2 crawl
+	./trivy-java-db --cache-dir $(cache) crawl
 
 .PHONY: db-build
 db-build: trivy-java-db
-	./trivy-java-db --cache-dir ./cache-2 build
+	./trivy-java-db --cache-dir $(cache) build
 
 .PHONY: db-compress
-db-compress: cache/*
-	tar cvzf cache/db/javadb.tar.gz -C cache/db/ trivy-java.db metadata.json
+db-compress: $(cache)/*
+	tar cvzf $(cache)/db/javadb.tar.gz -C $(cache)/db/ trivy-java.db metadata.json
 
 .PHONY: clean
 clean:
-	rm -rf cache/
+	rm -rf $(cache)
