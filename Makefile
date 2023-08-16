@@ -13,11 +13,11 @@ trivy-java-db: $(GO_SRCS)
 
 .PHONY: db-crawl
 db-crawl: trivy-java-db
-	./trivy-java-db --cache-dir ./cache crawl
+	./trivy-java-db --cache-dir ./cache-2 crawl
 
 .PHONY: db-build
 db-build: trivy-java-db
-	./trivy-java-db --cache-dir ./cache build
+	./trivy-java-db --cache-dir ./cache-2 build
 
 .PHONY: db-compress
 db-compress: cache/*

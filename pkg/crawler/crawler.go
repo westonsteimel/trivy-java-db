@@ -28,7 +28,6 @@ const mavenRepoURL = "https://repo.maven.apache.org/maven2/"
 
 type Crawler struct {
 	dir  string
-	jarDir string
 	http *retryablehttp.Client
 
 	rootUrl string
@@ -56,7 +55,6 @@ func NewCrawler(opt Option) Crawler {
 
 	return Crawler{
 		dir:  indexDir,
-		jarDir: filepath.Join(opt.CacheDir, "jars"),
 		http: client,
 		rootUrl: opt.RootUrl,
 		urlCh:   make(chan string, opt.Limit*10),
@@ -199,31 +197,36 @@ func (c *Crawler) crawlSHA1(baseURL string, meta *Metadata) error {
 		ArchiveType: types.JarType,
 	}
 
-	keep := false
+	incorrect := false
 
 	for _, version := range meta.Versioning.Versions {
 		jarFileName := fmt.Sprintf("/%s-%s.jar", meta.ArtifactID, version)
 		url := baseURL + version + jarFileName
-		isCorrect, syftPurl, err := c.correctIdFromJar(url, jarFileName, index.GroupID, index.ArtifactID)
+		isCorrect, syftPurl, err := c.correctIdFromJar(url, jarFileName, index.GroupID, index.ArtifactID, false)
 
 		if err != nil {
 			fmt.Println(err)
 		}
 			
 		if !isCorrect {
-			keep = true
+			incorrect = true
 			index.SyftPurl = syftPurl
 			break
+		} else {
+			index.SyftPurl = syftPurl
 		}
 	}
 	
-	if keep {
-		fileName := fmt.Sprintf("%s.json", index.ArtifactID)
-		filePath := filepath.Join(c.dir, index.GroupID, fileName)
-		if err := fileutil.WriteJSON(filePath, index); err != nil {
-			return xerrors.Errorf("json write error: %w", err)
-		}
+	fileName := fmt.Sprintf("%s.json", index.ArtifactID)
+	filePath := filepath.Join(c.dir, "correct", index.GroupID, fileName)
+	if incorrect {
+		filePath = filepath.Join(c.dir, "incorrect", index.GroupID, fileName)
 	}
+
+	if err := fileutil.WriteJSON(filePath, index); err != nil {
+		return xerrors.Errorf("json write error: %w", err)
+	}
+
 	return nil
 }
 
@@ -289,9 +292,9 @@ func (c *Crawler) fetchSHA1(url string) ([]byte, error) {
 	return sha1b, nil
 }
 
-func (c *Crawler) correctIdFromJar(url string, jarName string, groupId string, artifactId string) (bool, string, error) {
+func (c *Crawler) correctIdFromJar(url string, jarName string, groupId string, artifactId string, keep bool) (bool, string, error) {
 	//fmt.Print(jarName)
-	filePath := filepath.Join(c.jarDir, groupId, jarName)
+	filePath := filepath.Join(c.dir, "jars", groupId, jarName)
 	if err := os.MkdirAll(filepath.Dir(filePath), os.ModePerm); err != nil {
 		return false, "", xerrors.Errorf("unable to create a directory: %w", err)
 	}
@@ -301,7 +304,10 @@ func (c *Crawler) correctIdFromJar(url string, jarName string, groupId string, a
 		return false, "", xerrors.Errorf("unable to open %s: %w", filePath, err)
 	}
 	defer f.Close()
-	defer os.Remove(filePath)
+
+	if !keep {
+		defer os.Remove(filePath)
+	}
 
 	resp, err := c.http.Get(url)
 	// some projects don't have xxx.jar and xxx.jar.sha1 files
@@ -313,7 +319,6 @@ func (c *Crawler) correctIdFromJar(url string, jarName string, groupId string, a
 	}
 	defer resp.Body.Close()
 
-	// Writer the body to file
 	_, err = io.Copy(f, resp.Body)
 	if err != nil  {
 	  	return false, "", err

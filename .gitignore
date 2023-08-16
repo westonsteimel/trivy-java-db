@@ -24,4 +24,4 @@ hs_err_pid*
 
 trivy-java-db
 .idea
-cache/
+cache*
