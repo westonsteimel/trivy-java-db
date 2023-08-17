@@ -2,11 +2,9 @@ package crawler
 
 import (
 	"context"
-	"encoding/hex"
 	"encoding/xml"
+	"errors"
 	"fmt"
-	"github.com/aquasecurity/trivy-java-db/pkg/fileutil"
-	"github.com/aquasecurity/trivy-java-db/pkg/types"
 	"io"
 	"log"
 	"net/http"
@@ -15,9 +13,9 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/anchore/syft/syft/source"
-	"github.com/anchore/syft/syft"
-	"github.com/anchore/syft/syft/pkg/cataloger"
+	"github.com/aquasecurity/trivy-java-db/pkg/fileutil"
+	"github.com/aquasecurity/trivy-java-db/pkg/types"
+
 	"github.com/PuerkitoBio/goquery"
 	"github.com/hashicorp/go-retryablehttp"
 	"golang.org/x/sync/semaphore"
@@ -54,8 +52,8 @@ func NewCrawler(opt Option) Crawler {
 	log.Printf("Index dir %s", indexDir)
 
 	return Crawler{
-		dir:  indexDir,
-		http: client,
+		dir:     indexDir,
+		http:    client,
 		rootUrl: opt.RootUrl,
 		urlCh:   make(chan string, opt.Limit*10),
 		limit:   semaphore.NewWeighted(opt.Limit),
@@ -151,7 +149,7 @@ func (c *Crawler) Visit(url string) error {
 			return xerrors.Errorf("metadata parse error: %w", err)
 		}
 		if meta != nil {
-			if err = c.crawlSHA1(url, meta); err != nil {
+			if err = c.crawlLatestJar(url, meta); err != nil {
 				return err
 			}
 			// Return here since there is no need to crawl dirs anymore.
@@ -170,57 +168,50 @@ func (c *Crawler) Visit(url string) error {
 	return nil
 }
 
-func (c *Crawler) crawlSHA1(baseURL string, meta *Metadata) error {
-	var versions []Version
-	for _, version := range meta.Versioning.Versions {
-		sha1FileName := fmt.Sprintf("/%s-%s.jar.sha1", meta.ArtifactID, version)
-		sha1, err := c.fetchSHA1(baseURL + version + sha1FileName)
-		if err != nil {
-			return err
-		}
-		if len(sha1) != 0 {
-			v := Version{
-				Version: version,
-				SHA1:    sha1,
-			}
-			versions = append(versions, v)
-		}
+func checkFileExists(filePath string) bool {
+	_, error := os.Stat(filePath)
+	return !errors.Is(error, os.ErrNotExist)
+}
+
+func (c *Crawler) crawlLatestJar(baseURL string, meta *Metadata) error {
+	fileName := fmt.Sprintf("%s.json", meta.ArtifactID)
+	filePath := filepath.Join(c.dir, "metadata", meta.GroupID, fileName)
+
+	if checkFileExists(filePath) {
+		return nil
 	}
-	if len(versions) == 0 {
+
+	latestVersion := meta.Versioning.Latest
+
+	if latestVersion == "" {
+		numVersions := len(meta.Versioning.Versions)
+		if numVersions == 0 {
+			log.Printf("Unable to find any versions for %s\n", baseURL)
+			return nil
+		}
+		latestVersion = meta.Versioning.Versions[numVersions-1]
+	}
+
+	jarFileName := fmt.Sprintf("/%s-%s.jar", meta.ArtifactID, latestVersion)
+	url := baseURL + latestVersion + jarFileName
+	jarFilePath := filepath.Join(c.dir, "jars", meta.GroupID, jarFileName)
+	success, err := c.downloadJar(url, jarFilePath)
+	if err != nil {
+		return err
+	}
+
+	if !success {
 		return nil
 	}
 
 	index := &Index{
-		GroupID:     meta.GroupID,
-		ArtifactID:  meta.ArtifactID,
-		Versions:    versions,
-		ArchiveType: types.JarType,
-	}
-
-	incorrect := false
-
-	for _, version := range meta.Versioning.Versions {
-		jarFileName := fmt.Sprintf("/%s-%s.jar", meta.ArtifactID, version)
-		url := baseURL + version + jarFileName
-		isCorrect, syftPurl, err := c.correctIdFromJar(url, jarFileName, index.GroupID, index.ArtifactID, false)
-
-		if err != nil {
-			fmt.Println(err)
-		}
-			
-		if !isCorrect {
-			incorrect = true
-			index.SyftPurl = syftPurl
-			break
-		} else {
-			index.SyftPurl = syftPurl
-		}
-	}
-	
-	fileName := fmt.Sprintf("%s.json", index.ArtifactID)
-	filePath := filepath.Join(c.dir, "correct", index.GroupID, fileName)
-	if incorrect {
-		filePath = filepath.Join(c.dir, "incorrect", index.GroupID, fileName)
+		URL:          url,
+		LocalPath:    jarFilePath,
+		GroupID:      meta.GroupID,
+		ArtifactID:   meta.ArtifactID,
+		Version:      latestVersion,
+		ArchiveType:  types.JarType,
+		ExpectedPURL: fmt.Sprintf("pkg:maven/%s/%s@%s", meta.GroupID, meta.ArtifactID, latestVersion),
 	}
 
 	if err := fileutil.WriteJSON(filePath, index); err != nil {
@@ -254,52 +245,44 @@ func (c *Crawler) parseMetadata(url string) (*Metadata, error) {
 	return &meta, nil
 }
 
-func (c *Crawler) fetchSHA1(url string) ([]byte, error) {
+func (c *Crawler) downloadJar(url string, jarFilePath string) (bool, error) {
 	resp, err := c.http.Get(url)
 	// some projects don't have xxx.jar and xxx.jar.sha1 files
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, nil // TODO add special error for this
+		log.Printf("jar not found for %s\n", url)
+		return false, nil // TODO add special error for this
 	}
 	if err != nil {
-		return nil, xerrors.Errorf("can't get sha1 from %s: %w", url, err)
+		return false, xerrors.Errorf("can't get jar from %s: %w", url, err)
 	}
 	defer resp.Body.Close()
 
-	sha1, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, xerrors.Errorf("can't read sha1 %s: %w", url, err)
+	if err := os.MkdirAll(filepath.Dir(jarFilePath), os.ModePerm); err != nil {
+		return false, xerrors.Errorf("unable to create a directory: %w", err)
 	}
 
-	// there are empty xxx.jar.sha1 files. Skip them.
-	// e.g. https://repo.maven.apache.org/maven2/org/wso2/msf4j/msf4j-swagger/2.5.2/msf4j-swagger-2.5.2.jar.sha1
-	// https://repo.maven.apache.org/maven2/org/wso2/carbon/analytics/org.wso2.carbon.permissions.rest.api/2.0.248/org.wso2.carbon.permissions.rest.api-2.0.248.jar.sha1
-	if len(sha1) == 0 {
-		return nil, nil
+	f, err := os.Create(jarFilePath)
+	if err != nil {
+		return false, xerrors.Errorf("unable to open %s: %w", jarFilePath, err)
 	}
-	// there are xxx.jar.sha1 files with additional data. e.g.:
-	// https://repo.maven.apache.org/maven2/aspectj/aspectjrt/1.5.2a/aspectjrt-1.5.2a.jar.sha1
-	// https://repo.maven.apache.org/maven2/xerces/xercesImpl/2.9.0/xercesImpl-2.9.0.jar.sha1
-	var sha1b []byte
-	for _, s := range strings.Split(strings.TrimSpace(string(sha1)), " ") {
-		sha1b, err = hex.DecodeString(s)
-		if err == nil {
-			break
-		}
+	defer f.Close()
+
+	_, err = io.Copy(f, resp.Body)
+	if err != nil {
+		return false, err
 	}
-	if len(sha1b) == 0 {
-		return nil, xerrors.Errorf("failed to decode sha1 %s: %w", url, err)
-	}
-	return sha1b, nil
+
+	return true, nil
 }
 
-func (c *Crawler) correctIdFromJar(url string, jarName string, groupId string, artifactId string, keep bool) (bool, string, error) {
+/* func (c *Crawler) correctIdFromJar(url string, jarName string, groupId string, artifactId string, keep bool) (bool, string, error) {
 	//fmt.Print(jarName)
 	filePath := filepath.Join(c.dir, "jars", groupId, jarName)
 	if err := os.MkdirAll(filepath.Dir(filePath), os.ModePerm); err != nil {
 		return false, "", xerrors.Errorf("unable to create a directory: %w", err)
 	}
 
-    f, err := os.Create(filePath)
+	f, err := os.Create(filePath)
 	if err != nil {
 		return false, "", xerrors.Errorf("unable to open %s: %w", filePath, err)
 	}
@@ -320,24 +303,24 @@ func (c *Crawler) correctIdFromJar(url string, jarName string, groupId string, a
 	defer resp.Body.Close()
 
 	_, err = io.Copy(f, resp.Body)
-	if err != nil  {
-	  	return false, "", err
+	if err != nil {
+		return false, "", err
 	}
 
 	detection, err := source.Detect(filePath, source.DefaultDetectConfig())
 	if err != nil {
-        return false, "", fmt.Errorf("package cataloger: %w", err)
-    }
+		return false, "", fmt.Errorf("package cataloger: %w", err)
+	}
 
 	src, err := detection.NewSource(source.DefaultDetectionSourceConfig())
 	if err != nil {
-        return false, "", fmt.Errorf("package cataloger: %w", err)
-    }
+		return false, "", fmt.Errorf("package cataloger: %w", err)
+	}
 
 	catalog, _, _, err := syft.CatalogPackages(src, cataloger.DefaultConfig())
-    if err != nil {
-        return false, "", fmt.Errorf("package cataloger: %w", err)
-    }
+	if err != nil {
+		return false, "", fmt.Errorf("package cataloger: %w", err)
+	}
 
 	if catalog != nil {
 		packages := catalog.PackagesByName(artifactId)
@@ -354,4 +337,4 @@ func (c *Crawler) correctIdFromJar(url string, jarName string, groupId string, a
 	}
 
 	return false, "", nil
-}
+} */

@@ -9,18 +9,21 @@ type Metadata struct {
 }
 
 type Versioning struct {
-	//Latest      string   `xml:"latest"`
-	//Release     string   `xml:"release"`
+	Latest      string   `xml:"latest"`
+	Release     string   `xml:"release"`
 	Versions    []string `xml:"versions>version"`
 	LastUpdated string   `xml:"lastUpdated"`
 }
 
 type Index struct {
-	GroupID     string
-	ArtifactID  string
-	Versions    []Version
-	ArchiveType types.ArchiveType
-	SyftPurl 	string
+	URL          string
+	LocalPath    string
+	GroupID      string
+	ArtifactID   string
+	Version      string
+	Versions     []Version
+	ArchiveType  types.ArchiveType
+	ExpectedPURL string
 }
 type Version struct {
 	Version string
